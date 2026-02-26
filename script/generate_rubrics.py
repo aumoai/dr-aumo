@@ -13,30 +13,89 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# TODO: set up your litellm api key
+# TODO add key
+# os.environ["OPENAI_API_KEY"] = "dummy"
 litellm.cache = Cache(type="disk", disk_cache_dir="litellm_cache/")
 
+
 # --------------- Prompts ---------------
-retrieval_prompt_w_snippets = """I will write a query that tests literature knowledge and give you a list of  snippets. Your task is to come back with a list of elements you would expect to see in the answer, and associate relevant snippets.
- 
-Each element should include an "ingredient", which is a detailed descriptor of what is expected in an answer, a "handle", which is a short descriptor that slightly abstracts away from the ingredient description (don't make the handles specific), and "specifics", which lists relevant texts and citations from the snippets given below. Finally group the elements into 3 categories: "Answer Critical": necessary elements without this you'd not have an answer, "Valuable": key supporting information are useful but not as necessary as "Answer Critical", and "Context": elaborations or background that help understanding. 
+retrieval_prompt_w_snippets = """You will receive: (1) a user Question that tests literature knowledge, and (2) a list of Snippets (each with an id and text).
+Your task: design a rubric — a compact set of elements ("ingredients") that a high-quality final answer should satisfy, and map each element to the most relevant snippets.
 
-Rules:
-* When you pull from the snippets, make sure that the text and citations exactly match the provided snippets.
-* Include as many unique and relevant citations as you can. 
-* For Context ingredients, only provide ingredients that have at least 2 citations.
-* Ingredient descriptor should always start with a verb of command. It is a requirement so we want command verbs like "Mention", "Specify", "Describe", "Include", "Discuss" etc that specifies what a good answer should contain.
-* It is acceptable to include ingredients even if no snippets support them or if the available snippets are insufficient. However, only do so when you have high confidence that the ingredient is essential for a well-grounded answer.
+Important: You are specifying what a *good answer must contain*, not grading any existing answer. Use ONLY the provided snippets for evidence.
 
-Return your answer in a json format, structured like this: 
+--------------------------------
+INPUT FORMAT
+--------------------------------
+- Question: a single string.
+- Snippets: a list of items. Each item has:
+  - id: a unique identifier (e.g., S_abcd123, DOI/CorpusID, or similar).
+  - text: the snippet content (the ONLY citable text).
 
-{ "Question":<query>, 
-"Answer Critical": [ { "Ingredient": <ingredient>, "Handle":<handle>, 
-"Specifics":[{"Text":<snippet text>, "Citation":<corpus_id>}...]}...], 
-"Valuable": [same structure as answer critical], "Context": [same structure] 
+--------------------------------
+WHAT TO RETURN
+--------------------------------
+Return a single JSON object with EXACTLY these top-level keys:
+{
+  "Question": <string>,
+  "Answer Critical": [
+    { "Ingredient": <string>, "Handle": <string>, "Specifics": [ { "Text": <string>, "Citation": <id> } ... ] }
+  ],
+  "Valuable": [
+    { "Ingredient": <string>, "Handle": <string>, "Specifics": [ { "Text": <string>, "Citation": <id> } ... ] }
+  ],
+  "Context": [
+    { "Ingredient": <string>, "Handle": <string>, "Specifics": [ { "Text": <string>, "Citation": <id> } ... ] }
+  ]
 }
 
-###
+--------------------------------
+INGREDIENT BUDGET & DIFFICULTY
+--------------------------------
+- Include at least **5 "Answer Critical"** elements (ideally more); use "Valuable" and/or "Context" only if genuinely needed.
+- Make each element **detailed and challenging**: it should bundle multiple precise, testable requirements for the same capability (multi-criteria), not broad or vague checks.
+- Make each element **detailed and challenging**: write it as a **multi-criteria** requirement (multiple precise, testable sub-checks for a single capability).
+
+Examples of strong multi-criteria formulations:
+- "State the **exact <value>**; **cite ≥2 independent snippets** that directly support it; **specify the relevant time/version** (e.g., year, edition, release)."
+- "Identify the **primary mechanism/definition**; **contrast with the closest alternative**; **include one qualifier** that constrains interpretation."
+- "Report the **numeric result with units**; **include method/source context**; **note any threshold/exclusion** that changes the value."
+
+--------------------------------
+ELEMENT REQUIREMENTS
+--------------------------------
+Each element is one checklist item the final answer should satisfy:
+- **Ingredient**: Start with a command verb (e.g., "State", "Specify", "Identify", "Cite", "Describe", "Compare", "Quantify", "Explain", "Include", "Discuss"). Make it **multi-criteria** for one capability; use semicolons/clauses to enumerate sub-requirements. Avoid vague "and/or."
+- **Handle**: Short (2-5 words, Title Case), general label that abstracts the ingredient.
+- **Specifics**: Zero or more exact quotes from snippets:
+  - "Text": an **exact substring** from a snippet's **text** (preserve punctuation/casing; do not paraphrase).
+  - "Citation": the snippet's **id exactly as provided**.
+  - Prefer **multiple, diverse** snippets per element when available; avoid repeating the same quote.
+
+--------------------------------
+GROUPING & PRIORITY
+--------------------------------
+- **Answer Critical**: Minimal essentials that directly determine correctness/completeness (missing any makes the answer effectively wrong/incomplete).
+- **Valuable**: Substantial supports that improve reliability, precision, or traceability (e.g., stronger sourcing, key qualifiers, scope clarifications).
+- **Context**: Helpful background that aids understanding but is not required for correctness.
+
+--------------------------------
+RULES
+--------------------------------
+1) **Evidence scope**: Cite ONLY from the provided snippets. Do NOT use outside knowledge.
+2) **Exactness**: Quotes must be exact substrings from snippet text. No edits to punctuation, casing, or numbers.
+3) **Maximize distinct support**: Where possible, include ≥2 unique citations in a single element's "Specifics" to satisfy its multi-criteria checks.
+4) **Context breadth**: Any "Context" element must include **≥2 citations** in "Specifics".
+5) **Unsupported essentials (rare)**: If an ingredient is clearly essential but no snippet supports it, include it with "Specifics": [] — use sparingly and only with high confidence.
+6) **No duplication**: Do not create multiple elements that check the same requirement; merge into a single, stronger multi-criteria ingredient.
+7) **Stay under the cap**: Do not exceed **4 total elements** across all categories.
+8) **Raw JSON only**: Return valid JSON (no Markdown, comments, or trailing commas).
+
+--------------------------------
+RECOMMENDED DISTRIBUTIONS (guidance, not strict)
+--------------------------------
+- 3 "Answer Critical" + 1 "Valuable"; or
+- 2 "Answer Critical" + 1 "Valuable" + 1 "Context" (ensure Context has ≥2 citations).
 """
 
 retrieval_prompt_no_snippets = """I will provide a query that requires up-to-date, real-world knowledge. Produce a comprehensive long-form report that synthesizes all necessary information. Your task is to come back with a list of elements you would expect to see in the answer. Each element should include an "ingredient", which is a detailed descriptor of what is expected in an answer (start with a verb whenever it makes sense) and a "handle", which is a short descriptor that slightly abstracts away from the ingredient description. Finally group the elements into 3 categories: "Answer Critical": necessary elements without this you'd not have an answer, "Valuable": key supporting information are useful but not as necessary as "Answer Critical", and "Context": elaborations or background that help understanding.
@@ -133,60 +192,112 @@ def write_jsonl(path, rows):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-# TODO: Set S2_API_KEY in your environment variables
 # --------------- S2 API ---------------
-def retrieve_s2_snippet(query, limit=10):
+def retrieve_s2_snippet(query: str, limit: int = 10, retries: int = 2):
+    """
+    Call S2 snippet search. On failure, retry a few times; if it still fails, return [].
+    """
+    url = "https://api.semanticscholar.org/graph/v1/snippet/search"
     params = {
         "query": query,
-        "limit": limit,
+        "limit": int(limit),
         "minCitationCount": 10,
-        "fields": "snippet.text",
+        # include paper fields we read below
+        "fields": "snippet.text,paper.title,paper.paperId,paper.corpusId",
     }
     key = os.getenv("S2_API_KEY")
     headers = {"x-api-key": key} if key else {}
 
-    # Call S2 snippet search
-    resp = requests.get(
-        "https://api.semanticscholar.org/graph/v1/snippet/search",
-        params=params,
-        headers=headers,
-        timeout=30,
-    )
-    data = resp.json()
+    attempts = retries + 1
+    for i in range(attempts):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=20)
 
-    if isinstance(data, str):
-        data = json.loads(data)
+            # simple retry on 429/5xx
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                time.sleep(1.0)
+                continue
 
-    processed = []
+            if not resp.ok:
+                return []
 
-    for idx, item in enumerate(data.get("data", [])):
-        paper = item.get("paper", {}) or {}
-        text = ((item.get("snippet") or {}).get("text") or "").strip()
-        title = paper.get("title") or ""
-        paper_id = paper.get("corpusId") or paper.get("paperId") or paper.get("id")
+            # parse JSON safely
+            try:
+                data = resp.json()
+            except json.JSONDecodeError:
+                time.sleep(0.5)
+                continue
 
-        rec = {"paperID": paper_id, "title": title, "text": text}
-        processed.append(rec)
-    print(
-        "{0} snippets are retrieved. Top1: {1}".format(
-            len(processed), processed[0]["title"]
-        )
-    )
-    return processed
+            if isinstance(data, str):
+                # rare case: JSON returned as a string
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+
+            processed = []
+            for item in data.get("data", []):
+                paper = item.get("paper") or {}
+                snippet = item.get("snippet") or {}
+                processed.append(
+                    {
+                        "paperID": paper.get("corpusId")
+                        or paper.get("paperId")
+                        or paper.get("id"),
+                        "title": paper.get("title") or "",
+                        "text": (snippet.get("text") or "").strip(),
+                    }
+                )
+            return processed
+
+        except requests.RequestException:
+            time.sleep(0.5)
+            continue
+
+    # All attempts failed
+    return []
 
 
 # --------------- Web search API ---------------
-# TODO: Set SERPER_API_KEY in your environment variables
-
 def serper_search(query):
-    conn = http.client.HTTPSConnection("google.serper.dev")
-    key = os.getenv("SERPER_API_KEY")
-    payload = json.dumps({"q": query})
-    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
-    conn.request("POST", "/search", payload, headers)
-    res = conn.getresponse()
-    data = res.read()
-    return json.loads(data.decode("utf-8"))["organic"]
+    try:
+        conn = http.client.HTTPSConnection("google.serper.dev", timeout=20)
+        key = os.getenv("SERPER_API_KEY")
+        if not key:
+            return []
+
+        payload = json.dumps({"q": query})
+        headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+
+        def _once():
+            conn.request("POST", "/search", payload, headers)
+            res = conn.getresponse()
+            data = res.read()
+            return res.status, data
+
+        status, data = _once()
+        if status == 429:
+            time.sleep(10)
+            status, data = _once()
+
+        if not (200 <= status < 300):
+            return []
+
+        try:
+            j = json.loads(data.decode("utf-8"))
+        except Exception:
+            return []
+
+        # Prefer "organic"; fall back if absent
+        if isinstance(j, dict):
+            for key_name in ("organic", "news", "knowledgeGraph", "answerBox"):
+                v = j.get(key_name)
+                if isinstance(v, list):
+                    return v
+        return []
+    except Exception:
+        return []
 
 
 def serper_scrape(url):
@@ -197,7 +308,23 @@ def serper_scrape(url):
     conn.request("POST", "/", payload, headers)
     res = conn.getresponse()
     data = res.read()
-    return json.loads(data.decode("utf-8"))["text"]
+    try:
+        j = json.loads(data.decode("utf-8"))
+        if "text" in j and isinstance(j["text"], str):
+            return j["text"]
+    except Exception:
+        pass  # fall through to retry
+
+    # Retry once after a short backoff if "text" missing or any error occurred
+    time.sleep(10)
+    try:
+        conn.request("POST", "/", payload, headers)
+        res = conn.getresponse()
+        data = res.read()
+        j = json.loads(data.decode("utf-8"))
+        return j.get("text", "")
+    except Exception:
+        return ""
 
 
 def accept_up_to_max_words(
@@ -227,32 +354,34 @@ def accept_up_to_max_words(
 
 
 def retrieve_web(query, run_scrape=True):
-    serper_results = serper_search(query)
+    serper_results = serper_search(query) or []
     snippets = []
+
+    if not serper_results:
+        return snippets
+
     if run_scrape is True:
         for idx, s in enumerate(serper_results):
-            if idx < 3:
-                scraped_text = accept_up_to_max_words(serper_scrape(s["link"]))
+            title = s.get("title") or s.get("link") or "Untitled"
+            link = s.get("link") or s.get("url") or ""
+            summary = s.get("snippet") or s.get("description") or ""
 
-                snippets.append(
-                    {
-                        "title": s["title"],
-                        "text": "Summary: {0}\nFull text:\n{1}".format(
-                            s["snippet"], scraped_text
-                        ),
-                    }
+            if idx < 3 and link:
+                scraped_text = accept_up_to_max_words(serper_scrape(link))
+                full_text = (
+                    f"Summary: {summary}\nFull text:\n{scraped_text}"
+                    if scraped_text
+                    else f"Summary: {summary}"
                 )
+                snippets.append({"title": title, "text": full_text})
             else:
-                snippets.append({"title": s["title"], "text": s["snippet"]})
-
+                snippets.append({"title": title, "text": summary})
     else:
         for s in serper_results:
-            snippets.append({"title": s["title"], "text": s["snippet"]})
-    print(
-        "{0} snippets are retrieved. Top1: {1}".format(
-            len(snippets), snippets[0]["title"]
-        )
-    )
+            title = s.get("title") or s.get("link") or "Untitled"
+            summary = s.get("snippet") or s.get("description") or ""
+            snippets.append({"title": title, "text": summary})
+
     return snippets
 
 
@@ -274,7 +403,9 @@ def extract_json_from_response(response):
         return None
 
 
-def call_llm(query, output_file, error_file, no_retrieval=False, search_tool="s2"):
+def call_llm_snippets(
+    query, output_file, error_file, no_retrieval=False, search_tool="s2"
+):
     if no_retrieval is True:
         prompt = retrieval_prompt_no_snippets + f"Query: {query}"
     else:
@@ -287,14 +418,13 @@ def call_llm(query, output_file, error_file, no_retrieval=False, search_tool="s2
         snippets_text = " ".join(
             [item["title"] + "\n" + item["text"] for item in snippets]
         )
-        print(snippets_text[:1000])
         prompt = (
             retrieval_prompt_w_snippets + f"Query: {query}\nSnippets:\n{snippets_text}"
         )
 
     msgs = [{"role": "user", "content": prompt}]
     resp = litellm.completion(
-        model="gpt-4.1",
+        model="gpt-4.1-mini-2025-04-14",  # originally gpt-4.1
         messages=msgs,
     )
 
@@ -321,57 +451,66 @@ def call_llm(query, output_file, error_file, no_retrieval=False, search_tool="s2
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hf_path", default=None, help="Path to input HF")
-    ap.add_argument("--input", help="Path to write input JSONL")
-    ap.add_argument("--output", required=True, help="Path to write output JSONL")
-    ap.add_argument("--error", required=True, help="Path to write error JSONL")
+    ap.add_argument("--hf_path", type=str, default=None, help="Path to input HF")
+    ap.add_argument("--input", type=str, help="Path to write input JSONL")
+    ap.add_argument(
+        "--output", type=str, required=True, help="Path to write output JSONL"
+    )
+    ap.add_argument(
+        "--error", type=str, required=True, help="Path to write error JSONL"
+    )
+    ap.add_argument("--mode", type=str, required=True, help="Rubric generation mode")
+    ap.add_argument("--start_idx", type=int, default=0, help="Start index")
+    ap.add_argument("--end_idx", type=int, default=-1, help="Start index")
+    ap.add_argument(
+        "--search_tool",
+        type=str,
+        help="Search tools to be used for rubric generation modes",
+    )
     ap.add_argument(
         "--no_retrieval",
         action="store_true",
         help="set true to generate retrieval-free rubrics.",
     )
-    ap.add_argument("--source", help="source task name")
+    ap.add_argument("--asta", action="store_true", help="asta processed data")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
     if args.hf_path is not None:
-        input_data = datasets.load_dataset(args.hf_path)["train"]
+        input_data = list(datasets.load_dataset(args.hf_path)["train"])
+        input_data = [item for item in input_data]
     else:
         input_data = read_jsonl(args.input)
 
+    print(input_data[0])
     results = []
-    # For OS queries
-    # queries = [item["instance"]["query"] for item in input_data if "instance" in item]
-    if args.source == "searcharena":
-        queries = [
-            item["query"]
-            for item in input_data
-            if "query" in item and item["source"] == "searcharena"
-        ]  # search arena
-        search_tool = "web"
-    elif args.source == "openscholar":
-        queries = [
-            item["instance"]["query"] for item in input_data if "instance" in item
-        ]
-        search_tool = "s2"
-    else:
-        queries = [item["question"] for item in input_data if "question" in item]
-        search_tool = "web"
+
+    for item in input_data:
+        if "query" in item and "question" not in item:
+            item["question"] = item["query"]
+        if "messages" in item:
+            item["question"] = item["messages"][0]["content"]
 
     # this filter out search arena and healthbench
     results = []
-    for q in tqdm(queries, total=len(queries)):
-        try:
-            res = call_llm(
-                q, args.output, args.error, args.no_retrieval, search_tool=search_tool
+    end_idx = args.end_idx if args.end_idx > 0 else len(input_data)
+    for q in tqdm(input_data[args.start_idx : end_idx]):
+        if args.mode == "snippets":
+            # try:
+            res = call_llm_snippets(
+                q["question"],
+                args.output,
+                args.error,
+                args.no_retrieval,
+                search_tool=args.search_tool,
             )
             results.append(res)
-        except Exception as e:
-            # don't crash the whole run; log and continue
-            with open(args.error, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"query": q, "error": str(e)}) + "\n")
+        elif args.mode == "general":
+            # try:
+            res = call_llm_snippets(q["question"], args.output, args.error, True)
+            results.append(res)
     costs = 0
     for result in results:
         if "cost" in result:
