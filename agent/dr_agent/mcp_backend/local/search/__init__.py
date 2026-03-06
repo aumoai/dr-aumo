@@ -1,6 +1,14 @@
 from enum import Enum
-from .faiss_retriever import FaissSearcher
-from .bm25_retriever import BM25Searcher
+
+try:
+    from .bm25_retriever import BM25Searcher
+except ImportError:
+    BM25Searcher = None
+
+try:
+    from .faiss_retriever import FaissSearcher
+except ImportError:
+    FaissSearcher = None
 
 class SearcherType(Enum):
     """Enum for managing available searcher types and their CLI mappings."""
@@ -21,6 +29,11 @@ class SearcherType(Enum):
         """Get searcher class by CLI name."""
         for searcher_type in cls:
             if searcher_type.cli_name == cli_name:
+                if searcher_type.searcher_class is None:
+                    raise ImportError(
+                        f"Searcher type '{cli_name}' requires additional dependencies "
+                        f"(e.g., tevatron, qwen_omni_utils). Please install them first."
+                    )
                 return searcher_type.searcher_class
         raise ValueError(f"Unknown searcher type: {cli_name}")
 
