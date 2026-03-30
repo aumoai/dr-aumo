@@ -1,13 +1,24 @@
+import os
+import sys
 from enum import Enum
+
+# Guard against pyserini/pyjnius crashing the process when Java 16+ is unavailable.
+# When PYSERINI_DISABLE is set, we block the import entirely by injecting a fake
+# module so that pyjnius never attempts JVM initialization (which is unrecoverable).
+if os.environ.get("PYSERINI_DISABLE"):
+    import types
+    for mod_name in ("jnius", "jnius.reflect", "jnius_config"):
+        if mod_name not in sys.modules:
+            sys.modules[mod_name] = types.ModuleType(mod_name)
 
 try:
     from .bm25_retriever import BM25Searcher
-except ImportError:
+except (ImportError, RuntimeError, OSError, Exception):
     BM25Searcher = None
 
 try:
     from .faiss_retriever import FaissSearcher
-except ImportError:
+except (ImportError, RuntimeError, OSError, Exception):
     FaissSearcher = None
 
 class SearcherType(Enum):
